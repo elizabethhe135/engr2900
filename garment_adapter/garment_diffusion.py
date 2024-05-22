@@ -1,5 +1,8 @@
 import copy
 import pdb
+from PIL import Image, ImageOps
+import numpy as np
+import cv2
 
 import torch
 from safetensors import safe_open
@@ -15,13 +18,25 @@ else:
     from .attention_processor import REFAttnProcessor, AttnProcessor
 
 
+def make_inpaint_condition(image, image_mask):
+    image = np.array(image.convert("RGB")).astype(np.float32) / 255.0
+    image_mask = np.array(image_mask.convert("L")).astype(np.float32) / 255.0
+    assert image.shape[0:1] == image_mask.shape[0:1], "image and image_mask must have the same image size"
+    image[image_mask > 0.5] = -1.0  # set as masked pixel
+    image = np.expand_dims(image, 0).transpose(0, 3, 1, 2)
+    image = torch.from_numpy(image)
+    return image
+
+
 class ClothAdapter:
-    def __init__(self, sd_pipe, ref_path, device, enable_cloth_guidance, use_independent_condition, set_seg_model=True):
+    def __init__(self, sd_pipe, ref_path, device, enable_cloth_guidance, use_independent_condition, set_seg_model=True, 
+    person_path="./images/p0.png"):
         self.enable_cloth_guidance = enable_cloth_guidance
         self.use_independent_condition = use_independent_condition
         self.device = device
         self.pipe = sd_pipe.to(self.device)
         self.set_adapter(self.pipe.unet, "write")
+        self.person_path = person_path
 
         ref_unet = copy.deepcopy(sd_pipe.unet)
         if ref_unet.config.in_channels == 9:
@@ -40,7 +55,7 @@ class ClothAdapter:
         self.attn_store = {}
 
     def set_seg_model(self, ):
-        checkpoint_path = 'checkpoints/cloth_segm.pth'
+        checkpoint_path = '/home/lizcar/MagicClothing/MagicClothing/cloth_segm.pth'
         self.seg_net = load_seg_model(checkpoint_path, device=self.device)
 
     def set_adapter(self, unet, type):
@@ -59,14 +74,14 @@ class ClothAdapter:
             prompt=None,
             a_prompt="best quality, high quality",
             num_images_per_prompt=4,
-            negative_prompt=None,
+            negative_prompt="bare, monochrome, lowres, bad anatomy, worst quality, low quality",
             seed=-1,
-            guidance_scale=7.5,
+            guidance_scale=2.5,
             cloth_guidance_scale=2.5,
             num_inference_steps=20,
             height=512,
             width=384,
-            **kwargs,
+            image = None,
     ):
         if cloth_mask_image is None:
             cloth_mask_image = generate_mask(cloth_image, net=self.seg_net, device=self.device)
@@ -74,6 +89,47 @@ class ClothAdapter:
         cloth = prepare_image(cloth_image, height, width)
         cloth_mask = prepare_mask(cloth_mask_image, height, width)
         cloth = (cloth * cloth_mask).to(self.device, dtype=torch.float16)
+
+        if 1:
+        # if self.person_path is not None:
+            person_image = Image.open(self.person_path).convert("RGB")
+            person_mask_image = generate_mask(person_image, net=self.seg_net, device=self.device)
+            # person_mask_image = ImageOps.invert(person_mask_image)
+            person = prepare_image(person_image, height, width)
+            person_mask = prepare_mask(person_mask_image, height, width)
+            # person = (person * person_mask).to(self.device, dtype=torch.float16)
+            person = person.squeeze(0).cpu()
+            if person.is_floating_point():
+                person = (person * 255).byte()
+            person = person.permute(1, 2, 0).numpy()
+            person_image.save('./output_img/person.png')
+            cloth_mask_image.save('./output_img/cloth_mask.png')
+            inpaint_image = make_inpaint_condition(person_image, person_mask_image)
+            # print(image - inpaint_image)
+            
+            # inpaint_image_pil = Image.fromarray(inpaint_image.squeeze().permute(1,2,0).cpu().numpy())
+            inpaint_img_pil = inpaint_image.cpu()
+            if inpaint_img_pil.dim() > 3:
+                inpaint_img_pil = inpaint_img_pil.squeeze(0)  # Remove batch dimension if necessary
+
+            # Convert to 'uint8' if it's not already
+            if inpaint_img_pil.is_floating_point():
+                # Normalize and scale to 0-255 if your float tensor is normalized to [0, 1]
+                inpaint_img_pil = (inpaint_img_pil * 255).byte()
+
+            # Permute to change the order from (C, H, W) to (H, W, C)
+            # if inpaint_img_pil.dim() == 3 and inpaint_img_pil.size(0) == 3:  # Ensure it is 3 channels
+            #     inpaint_img_pil = inpaint_img_pil.permute(1, 2, 0)
+
+            # Convert to numpy array
+            # inpaint_img_pil_np = Image.fromarray(inpaint_img_pil.numpy())
+            # inpaint_img_pil_np.save('./output_img/inpaint.png')
+            # inpaint_image = make_inpaint_condition(Image.fromarray(person), Image.fromarray(person_mask.squeeze().cpu().numpy()))
+            # tmp_output = inpaint_image.squeeze().permute(1,2,0).cpu().numpy()
+            # cv2.imwrite('./output_img/tmp.png', tmp_output)
+            # cv2.imwrite('./output_img/person.png', person)
+            # pdb.set_trace()
+            # cv2.imwrite('./output_img/person_mask.png', person_mask.squeeze().permute(1,2,0).cpu().numpy())
 
         if prompt is None:
             prompt = "a photography of a model"
@@ -105,8 +161,8 @@ class ClothAdapter:
                 generator=generator,
                 height=height,
                 width=width,
-                cross_attention_kwargs={"attn_store": self.attn_store, "do_classifier_free_guidance": guidance_scale > 1.0, "enable_cloth_guidance": self.enable_cloth_guidance},
-                **kwargs,
+                cross_attention_kwargs={"attn_store": self.attn_store, "do_classifier_free_guidance": guidance_scale > 1.0, "enable_cloth_guidance": self.enable_cloth_guidance, "use_independent_condition": 1},
+                image=inpaint_image,
             ).images
         else:
             images = self.pipe(
@@ -118,7 +174,8 @@ class ClothAdapter:
                 height=height,
                 width=width,
                 cross_attention_kwargs={"attn_store": self.attn_store, "do_classifier_free_guidance": guidance_scale > 1.0, "enable_cloth_guidance": self.enable_cloth_guidance, "use_independent_condition": self.use_independent_condition},
-                **kwargs,
+                image=inpaint_image,
+                # **kwargs,
             ).images
 
         return images, cloth_mask_image
@@ -143,7 +200,7 @@ class ClothAdapter:
         cloth = (cloth * cloth_mask).to(self.device, dtype=torch.float16)
 
         with torch.inference_mode():
-            prompt_embeds_null = self.pipe.encode_prompt([""], device=self.device, num_images_per_prompt=num_images_per_prompt, do_classifier_free_guidance=False)[0]
+            prompt_embeds_null = self.pipe.encode_prompt(["a photography of a model"], device=self.device, num_images_per_prompt=num_images_per_prompt, do_classifier_free_guidance=False)[0]
             cloth_embeds = self.pipe.vae.encode(cloth).latent_dist.mode() * self.pipe.vae.config.scaling_factor
             self.ref_unet(torch.cat([cloth_embeds] * num_images_per_prompt), 0, prompt_embeds_null, cross_attention_kwargs={"attn_store": self.attn_store})
 
@@ -245,7 +302,7 @@ class ClothAdapter_AnimateDiff:
         cloth = (cloth * cloth_mask).to(self.device, dtype=torch.float16)
 
         if prompt is None:
-            prompt = "a asian girl with big smile"
+            prompt = "a photography of a model"
         prompt = prompt + ", " + a_prompt
         if negative_prompt is None:
             negative_prompt = "worst quality, low quality"
