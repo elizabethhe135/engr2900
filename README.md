@@ -1,4 +1,15 @@
 # Magic Clothing
+Added personal path:
+
+example command: 
+
+conda activate magicloth
+CUDA_VISIBLE_DEVICES=2 python inference.py --cloth_path ./images/m1.jpg --model_path /home/lizcar/MagicClothing/MagicClothing/magic_clothing_768_vitonhd_joint.safetensors --person_path=/home/lizcar/MagicClothing/images/Shi-2631-1.jpg
+
+Output will be generated.
+
+Please also add the model in the model in order for this to work. 
+
 This repository is the official implementation of Magic Clothing
 
 Magic Clothing is a branch version of [OOTDiffusion](https://github.com/levihsu/OOTDiffusion), focusing on controllable garment-driven image synthesis
